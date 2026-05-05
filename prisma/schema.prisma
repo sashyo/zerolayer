@@ -1,0 +1,344 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Runtime queries go through the transaction pooler (PgBouncer, port 6543).
+  // Schema migrations need a session-mode connection because PgBouncer doesn't
+  // proxy DDL transactions correctly, so they use the directUrl on port 5432.
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Users ───────────────────────────────────────────────────────────────────
+
+model User {
+  id          String     @id            // TideCloak `sub` claim
+  username    String     @unique
+  displayName String
+  avatarUrl   String?
+  bio         String?    // User-editable "About me" — plaintext, max 500 chars
+  accentColor String?    // Profile banner accent — CSS hex like #5865F2
+  pronouns    String?    // Short free-text pronouns (max 32 chars)
+  status      UserStatus @default(OFFLINE)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  // E2EE: per-user ECDH P-256 keypair. Public key is plain (used to wrap server
+  // keys for invites). Private key is stored after TideCloak self-encrypt — only
+  // this user's identity can unlock it via the _tide_x.selfdecrypt voucher.
+  // Both are base64. publicKey is SPKI-DER; encryptedPrivateKey is the
+  // TideCloak-self-encrypted ciphertext of the PKCS8-DER private key.
+  publicKey           String?
+  encryptedPrivateKey String?
+
+  ownedServers     Server[]        @relation("ServerOwner")
+  serverMembers    ServerMember[]
+  channelMembers   ChannelMember[]
+  messages         Message[]
+  reactions        Reaction[]
+  notifications    Notification[]
+  serverKeys       ServerKey[]
+  friendshipsSent  Friendship[]    @relation("FriendshipsSent")
+  friendshipsRecv  Friendship[]    @relation("FriendshipsRecv")
+
+  @@map("users")
+}
+
+// ─── Friendships ──────────────────────────────────────────────────────────────
+// Asymmetric requester/receiver pair plus status. The unique on (requesterId,
+// receiverId) prevents duplicate requests in the same direction; we allow the
+// reverse direction so two parallel requests collapse to a mutual friendship
+// the moment either side accepts.
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+}
+
+model Friendship {
+  id          String           @id @default(cuid())
+  requesterId String
+  receiverId  String
+  status      FriendshipStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+  acceptedAt  DateTime?
+
+  requester User @relation("FriendshipsSent", fields: [requesterId], references: [id], onDelete: Cascade)
+  receiver  User @relation("FriendshipsRecv", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([requesterId, receiverId])
+  @@index([receiverId, status])
+  @@index([requesterId, status])
+  @@map("friendships")
+}
+
+enum UserStatus {
+  ONLINE
+  IDLE
+  DND
+  OFFLINE
+}
+
+// ─── Servers (communities) ────────────────────────────────────────────────────
+
+model Server {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  iconUrl     String?
+  inviteCode  String   @unique @default(cuid())
+  ownerId     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Per-server delegated approval (TideCloak Forseti governance)
+  // ───────────────────────────────────────────────────────────────────────────
+  // srv_admin_<S>: holders can approve member-role changes for this server
+  // srv_member_<S>: composite role assigned to members; init-cert here gates approval
+  // approvalPolicySignedAt: master admin completed the init-cert step → server is "live"
+  // approvalContractHash: SHA-512 of the ServerOwnerApproval contract used at signing
+  srvAdminRoleId         String?
+  srvMemberRoleId        String?
+  approvalPolicySignedAt DateTime?
+  approvalContractHash   String?
+
+  // Current epoch version. Bumped when a member is removed (rotation).
+  // Old messages keep their own keyVersion so previously-stored wraps remain
+  // valid for historical decryption while new messages use the new version.
+  currentKeyVersion Int @default(1)
+
+  owner      User              @relation("ServerOwner", fields: [ownerId], references: [id])
+  members    ServerMember[]
+  channels   Channel[]
+  categories ChannelCategory[]
+  roles      Role[]
+  serverKeys ServerKey[]
+
+  @@map("servers")
+}
+
+// ─── Server keys ──────────────────────────────────────────────────────────────
+// Per-(server, user, version) wrap of the server's AES-GCM-256 epoch key.
+// The wrap is ECDH-ES with HKDF: ephemeral pubkey + AES-GCM(iv, sharedKey, epochKey).
+// Only the owner of the matching user keypair can unwrap.
+model ServerKey {
+  serverId     String
+  userId       String
+  version      Int
+  ephemeralPub String   // base64 SPKI of the ephemeral ECDH public key
+  iv           String   // base64 12-byte AES-GCM IV
+  wrappedKey   String   // base64 AES-GCM ciphertext of the raw 32-byte epoch key
+  createdAt    DateTime @default(now())
+
+  server Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([serverId, userId, version])
+  @@index([serverId, version])
+  @@map("server_keys")
+}
+
+// ─── Roles ────────────────────────────────────────────────────────────────────
+
+model Role {
+  id          String   @id @default(cuid())
+  serverId    String
+  name        String
+  color       String   @default("#99AAB5")
+  permissions BigInt   @default(0)
+  position    Int      @default(0)
+  isDefault   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  server  Server         @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members ServerMember[]
+
+  @@unique([serverId, name])
+  @@map("roles")
+}
+
+// ─── Server Members ───────────────────────────────────────────────────────────
+
+model ServerMember {
+  serverId String
+  userId   String
+  roleId   String?
+  nickname String?
+  joinedAt DateTime @default(now())
+
+  server Server  @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role?   @relation(fields: [roleId], references: [id])
+
+  @@id([serverId, userId])
+  @@map("server_members")
+}
+
+// ─── Channels ─────────────────────────────────────────────────────────────────
+
+model Channel {
+  id          String      @id @default(cuid())
+  serverId    String?                        // null for DMs / group DMs
+  name        String
+  description String?
+  type        ChannelType @default(TEXT)
+  isPrivate   Boolean     @default(false)
+  position    Int         @default(0)
+  categoryId  String?                        // optional grouping under a ChannelCategory
+  category    ChannelCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // E2EE in keypair-mode: messages are encrypted with the parent server's
+  // current epoch key (AES-GCM). No per-channel material is needed.
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  server   Server?         @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members  ChannelMember[]
+  messages Message[]
+
+  @@map("channels")
+}
+
+enum ChannelType {
+  TEXT
+  VOICE
+  DM
+  GROUP_DM
+}
+
+// ─── Channel Members ──────────────────────────────────────────────────────────
+
+model ChannelMember {
+  channelId  String
+  userId     String
+  lastReadAt DateTime?
+  joinedAt   DateTime  @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([channelId, userId])
+  @@map("channel_members")
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+
+model Message {
+  id        String      @id @default(cuid())
+  channelId String
+  authorId  String
+  // The server NEVER stores plaintext — only AES-GCM ciphertext (base64 IV‖CT)
+  content    String     // base64( iv(12B) ‖ ciphertext )
+  keyVersion Int        @default(1)  // server epoch this message was encrypted under
+  type       MessageType @default(TEXT)
+  replyToId  String?
+  editedAt   DateTime?
+  createdAt  DateTime    @default(now())
+  // Plaintext metadata — userIds the sender @mentioned at compose time.
+  // Server doesn't read message content (E2EE), so the sender resolves
+  // @username → userId locally and posts the list alongside ciphertext.
+  mentions   String[]    @default([])
+  // Whether this message is pinned in its channel. Pin/unpin is a channel
+  // action gated to the server owner; viewable by anyone in the channel.
+  isPinned   Boolean     @default(false)
+  pinnedAt   DateTime?
+
+  channel     Channel      @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author      User         @relation(fields: [authorId], references: [id])
+  attachments Attachment[]
+  reactions   Reaction[]
+
+  // Self-reference: a message can quote a previous message in the same channel.
+  // SetNull so deleting the parent doesn't cascade through replies.
+  replyTo   Message?  @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies   Message[] @relation("MessageReplies")
+
+  @@index([channelId, createdAt])
+  @@index([channelId, isPinned])
+  @@map("messages")
+}
+
+// ─── Channel categories ───────────────────────────────────────────────────────
+// Optional collapsible groups in the channel list, scoped per server. Channels
+// reference one via `categoryId`. SetNull on delete so removing a category
+// doesn't cascade-kill its channels.
+
+model ChannelCategory {
+  id        String   @id @default(cuid())
+  serverId  String
+  name      String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  server   Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  channels Channel[]
+
+  @@index([serverId, position])
+  @@map("channel_categories")
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  FILE
+  SYSTEM
+}
+
+// ─── Attachments ──────────────────────────────────────────────────────────────
+
+model Attachment {
+  id        String   @id @default(cuid())
+  messageId String
+  filename  String
+  url       String
+  size      Int
+  mimeType  String
+  createdAt DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@map("attachments")
+}
+
+// ─── Reactions ────────────────────────────────────────────────────────────────
+
+model Reaction {
+  id        String   @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String
+  createdAt DateTime @default(now())
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@map("reactions")
+}
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  data      Json
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@map("notifications")
+}
+
+enum NotificationType {
+  MENTION
+  DM
+  REACTION
+  SERVER_INVITE
+  SYSTEM
+}

@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+    --font-sans: "Inter", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", monospace;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-surface-300 text-white antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-surface-100/60;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-surface-100;
+  }
+
+  /* Focus ring */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand;
+  }
+
+  /* Selection */
+  ::selection {
+    @apply bg-brand/40 text-white;
+  }
+}
+
+@layer utilities {
+  .message-hover {
+    @apply transition-colors duration-75 hover:bg-surface-400/50;
+  }
+
+  .channel-item {
+    @apply flex cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-muted-foreground transition-colors
+           hover:bg-surface-400/50 hover:text-white;
+  }
+
+  .channel-item.active {
+    @apply bg-surface-400/70 text-white;
+  }
+
+  .server-icon {
+    @apply flex h-12 w-12 cursor-pointer items-center justify-center rounded-[16px] bg-surface-200
+           font-bold text-white transition-all duration-200 hover:rounded-xl hover:bg-brand;
+  }
+}
