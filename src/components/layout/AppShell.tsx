@@ -14,6 +14,8 @@ import { ToastHost } from "@/components/Toast";
 import { useUnreadListener } from "@/hooks/useUnreadListener";
 import { useUnread } from "@/components/providers/UnreadProvider";
 import { useTabTitleBadge } from "@/hooks/useTabTitleBadge";
+import { useKeys } from "@/components/providers/KeysProvider";
+import { AlertTriangle, RefreshCw } from "lucide-react";
 import { setServersCache, setDmsCache } from "@/lib/serversCache";
 import type { SerializedServer } from "@/types";
 
@@ -154,6 +156,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Surface a keypair-bootstrap failure with a one-click retry. Without this,
+  // a failed `IAMService.doEncrypt` leaves the user silently without a public
+  // key, and every later action says "Public key not yet published for this
+  // user" — but they have no idea the bootstrap failed.
+  const keys = useKeys();
+
   return (
     <div className="flex h-screen overflow-hidden bg-surface-300 text-white">
       <ServerRail
@@ -168,7 +176,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         onToggleMembers={() => setShowMembers((v) => !v)}
       />
 
-      <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
+      <main className="flex flex-1 flex-col overflow-hidden">
+        {keys.error && (
+          <div className="flex items-center gap-3 border-b border-yellow-500/30 bg-yellow-500/10 px-4 py-2 text-xs text-yellow-200">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span className="flex-1">
+              <strong className="font-semibold">E2EE keys couldn't be set up:</strong>{" "}
+              {keys.error}. Until this succeeds, others can't send you E2EE messages
+              and you'll see "Public key not yet published" errors.
+            </span>
+            <button
+              onClick={() => keys.resetKeys()}
+              className="flex items-center gap-1 rounded-md bg-yellow-500/20 px-2 py-1 font-medium text-yellow-100 hover:bg-yellow-500/30"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Retry
+            </button>
+          </div>
+        )}
+        {children}
+      </main>
 
       {activeServer && showMembers && (
         <MemberList

@@ -28,7 +28,16 @@ export async function GET(
       select: { id: true, username: true, publicKey: true },
     });
     if (!u || !u.publicKey) {
-      throw new ApiError("Public key not yet published for this user", 404);
+      // Two distinct cases share this 404 — distinguish the message so the
+      // UI can surface something useful:
+      //   • The user row is missing entirely → they've never logged in.
+      //   • The row exists but `publicKey` is null → they're logged in but
+      //     `useMyKeys` failed to bootstrap (often: IAMService not ready,
+      //     `doEncrypt` rejected, or POST /api/users/me/keys 4xx'd).
+      const msg = !u
+        ? "User hasn't logged in yet — they need to open the app once before you can DM or invite them."
+        : "User's E2EE keys haven't finished setting up yet. Ask them to refresh; if it persists they should click Retry on the yellow banner.";
+      throw new ApiError(msg, 404);
     }
     return Response.json({
       userId: u.id,

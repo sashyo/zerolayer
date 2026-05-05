@@ -56,6 +56,12 @@ export function useMyKeys() {
 
   useEffect(() => {
     if (isInitializing || !authenticated || !token) return;
+    // IAMService can race to be defined: useTideCloak() may return undefined
+    // for a tick after authenticated flips to true. Without this guard we'd
+    // try to call IAMService.doEncrypt on undefined and the bootstrap would
+    // throw — and because of the bootstrapping.current latch below, it
+    // wouldn't retry when IAMService finally appears. Bail until ready.
+    if (!IAMService) return;
     if (bootstrapping.current) return;
     bootstrapping.current = true;
 
@@ -105,6 +111,11 @@ export function useMyKeys() {
         setState({ publicKeyB64, ready: true, error: null });
       } catch (err: any) {
         console.error("[useMyKeys] bootstrap failed", err);
+        // Release the latch so the next render can retry. Without this the
+        // user is permanently stuck without a keypair — and every later
+        // lookup of their public key 404s with "Public key not yet
+        // published for this user".
+        bootstrapping.current = false;
         setState({
           publicKeyB64: null,
           ready: false,
