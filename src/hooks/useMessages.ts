@@ -11,6 +11,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTideCloak } from "@tidecloak/nextjs";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { useRealtimeChannel } from "@/components/providers/RealtimeProvider";
 import { decryptMessage } from "@/lib/crypto";
 import type { SerializedMessage } from "@/types";
@@ -19,7 +20,6 @@ type GetKey = (version: number) => Promise<CryptoKey | null>;
 
 export function useMessages(channelId: string | null, getKey: GetKey | null) {
   const { token } = useTideCloak();
-  const channel = useRealtimeChannel(channelId ? `messages:${channelId}` : null);
 
   const [messages, setMessages] = useState<SerializedMessage[]>([]);
   const [decryptedContent, setDecryptedContent] = useState<Map<string, string>>(
@@ -131,66 +131,78 @@ export function useMessages(channelId: string | null, getKey: GetKey | null) {
     setHasMore(false);
   }, [channelId]);
 
-  // Real-time subscription for message lifecycle events. Each broadcast event
-  // payload mirrors the previous Socket.IO contract; the channel itself is
-  // configured with `self: false` so the sender doesn't receive an echo of
-  // their own broadcast (we apply the local update optimistically).
-  useEffect(() => {
-    if (!channel) return;
+  // decryptBatch closes over getKeyRef so it's already stable; we still ref
+  // it here in case anything in this hook ever swaps it out — keeps the
+  // setup callback below truly stable across renders.
+  const decryptBatchRef = useRef(decryptBatch);
+  decryptBatchRef.current = decryptBatch;
 
-    channel
-      .on("broadcast", { event: "message:new" }, ({ payload }) => {
+  // Real-time subscription for message lifecycle events. Handlers MUST be
+  // attached BEFORE Supabase calls `.subscribe()` — we pass them as a setup
+  // callback so RealtimeProvider can register them in the right order. If
+  // we registered post-subscribe (the previous pattern), broadcasts were
+  // silently dropped: senders posted, receivers saw nothing until refresh.
+  // The channel is configured with `self: false` so the sender doesn't echo
+  // their own broadcast (we apply the local update optimistically).
+  const channel = useRealtimeChannel(
+    channelId ? `messages:${channelId}` : null,
+    useCallback((ch: RealtimeChannel) => {
+      ch.on("broadcast", { event: "message:new" }, ({ payload }: { payload: unknown }) => {
         const msg = payload as SerializedMessage;
         setMessages((prev) =>
           prev.some((m) => m.id === msg.id) ? prev : [...prev, msg],
         );
-        decryptBatch([msg]);
+        decryptBatchRef.current([msg]);
       })
-      .on("broadcast", { event: "message:edit" }, ({ payload }) => {
-        const msg = payload as SerializedMessage;
-        setMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
-        decryptBatch([msg]);
-      })
-      .on("broadcast", { event: "message:delete" }, ({ payload }) => {
-        const { messageId } = payload as { messageId: string };
-        setMessages((prev) => prev.filter((m) => m.id !== messageId));
-        setDecryptedContent((prev) => {
-          const next = new Map(prev);
-          next.delete(messageId);
-          return next;
-        });
-      })
-      .on("broadcast", { event: "reaction:toggle" }, ({ payload }) => {
-        const { messageId, emoji, added } = payload as {
-          messageId: string;
-          emoji: string;
-          added: boolean;
-        };
-        // Other users' reactions: `mine` is always false here (broadcast
-        // self:false means we never receive our own echo).
-        setMessages((prev) =>
-          prev.map((m) => {
-            if (m.id !== messageId) return m;
-            const idx = m.reactions.findIndex((r) => r.emoji === emoji);
-            const next = [...m.reactions];
-            if (added) {
-              if (idx >= 0) {
-                next[idx] = { ...next[idx], count: next[idx].count + 1 };
-              } else {
-                next.push({ emoji, count: 1, me: false });
+        .on("broadcast", { event: "message:edit" }, ({ payload }: { payload: unknown }) => {
+          const msg = payload as SerializedMessage;
+          setMessages((prev) => prev.map((m) => (m.id === msg.id ? msg : m)));
+          decryptBatchRef.current([msg]);
+        })
+        .on("broadcast", { event: "message:delete" }, ({ payload }: { payload: unknown }) => {
+          const { messageId } = payload as { messageId: string };
+          setMessages((prev) => prev.filter((m) => m.id !== messageId));
+          setDecryptedContent((prev) => {
+            const next = new Map(prev);
+            next.delete(messageId);
+            return next;
+          });
+        })
+        .on("broadcast", { event: "reaction:toggle" }, ({ payload }: { payload: unknown }) => {
+          const { messageId, emoji, added } = payload as {
+            messageId: string;
+            emoji: string;
+            added: boolean;
+          };
+          // Other users' reactions: `mine` is always false here (self:false
+          // means we never receive our own echo).
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== messageId) return m;
+              const idx = m.reactions.findIndex((r) => r.emoji === emoji);
+              const next = [...m.reactions];
+              if (added) {
+                if (idx >= 0) {
+                  next[idx] = { ...next[idx], count: next[idx].count + 1 };
+                } else {
+                  next.push({ emoji, count: 1, me: false });
+                }
+              } else if (idx >= 0) {
+                const newCount = next[idx].count - 1;
+                if (newCount <= 0) next.splice(idx, 1);
+                else
+                  next[idx] = { ...next[idx], count: newCount };
               }
-            } else if (idx >= 0) {
-              const newCount = next[idx].count - 1;
-              if (newCount <= 0) next.splice(idx, 1);
-              else next[idx] = { ...next[idx], count: newCount };
-            }
-            return { ...m, reactions: next };
-          }),
-        );
-      });
-    // No per-handler removal needed: the channel itself is torn down by
-    // RealtimeProvider when this hook unmounts.
-  }, [channel, decryptBatch]);
+              return { ...m, reactions: next };
+            }),
+          );
+        });
+    }, []),
+  );
+  // `channel` is now only used for outbound `.send()` from this hook (we
+  // don't currently use it that way, but keep it returned in case callers
+  // ever need it). The reference is intentional — see ESLint exhaustive-deps.
+  void channel;
 
   const loadMore = useCallback(
     () => fetchMessages(cursor ?? undefined),

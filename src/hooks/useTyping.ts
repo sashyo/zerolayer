@@ -10,25 +10,26 @@
  * The username is read from the TideCloak token rather than echoed by
  * server logic — so the broadcast payload never relies on server state.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTideCloak } from "@tidecloak/nextjs";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { useRealtimeChannel } from "@/components/providers/RealtimeProvider";
 
 const TYPING_TIMEOUT_MS = 3_000;
 
 export function useTyping(channelId: string | null) {
   const { getValueFromToken } = useTideCloak();
-  const channel = useRealtimeChannel(channelId ? `typing:${channelId}` : null);
   const [typingUsers, setTypingUsers] = useState<Map<string, string>>(new Map());
   const typingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const isTypingRef = useRef(false);
   const stopTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Listen for remote typing events.
-  useEffect(() => {
-    if (!channel) return;
-    channel
-      .on("broadcast", { event: "typing:start" }, ({ payload }) => {
+  // Register handlers BEFORE Supabase subscribes — see RealtimeProvider for
+  // why post-subscribe `.on()` calls silently drop events.
+  const channel = useRealtimeChannel(
+    channelId ? `typing:${channelId}` : null,
+    useCallback((ch: RealtimeChannel) => {
+      ch.on("broadcast", { event: "typing:start" }, ({ payload }: { payload: unknown }) => {
         const { userId, username } = payload as { userId: string; username: string };
         setTypingUsers((prev) => {
           const next = new Map(prev);
@@ -48,8 +49,7 @@ export function useTyping(channelId: string | null) {
             typingTimers.current.delete(userId);
           }, TYPING_TIMEOUT_MS),
         );
-      })
-      .on("broadcast", { event: "typing:stop" }, ({ payload }) => {
+      }).on("broadcast", { event: "typing:stop" }, ({ payload }: { payload: unknown }) => {
         const { userId } = payload as { userId: string };
         clearTimeout(typingTimers.current.get(userId));
         typingTimers.current.delete(userId);
@@ -59,7 +59,8 @@ export function useTyping(channelId: string | null) {
           return next;
         });
       });
-  }, [channel]);
+    }, []),
+  );
 
   const userId = (getValueFromToken("sub") as string) || "";
   const username =
